@@ -9,5 +9,5 @@ idf_component_register(
         esp_common
         esp_hw_support
 )
-# Se o warning do driver legacy virar erro:
-# target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=cpp)
+
+
