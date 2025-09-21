@@ -1,19 +1,4 @@
-// Esteira Industrial (ESP32 + FreeRTOS) — 4 tasks + Touch (polling) + Instrumentação RT
-// - ENC_SENSE (periódica 5 ms) -> notifica SPD_CTRL
-// - SPD_CTRL (hard RT) -> controle PI simulado, trata HMI (soft) se solicitado
-// - SORT_ACT (hard RT, evento Touch B) -> aciona "desviador"
-// - SAFETY_TASK (hard RT, evento Touch D) -> E-stop
-// - TOUCH (polling) e UART para injetar eventos
-// - STATS imprime métricas RT: releases, hard_miss, Cmax, Lmax (evento->start), Rmax (evento->end)
-// Requer ESP-IDF 5.5.x (driver touch legacy). O código compila mesmo sem habilitar trace/idle hook;
-// se habilitar, imprime %CPU e runtime-stats.
-//
-// DICAS MENUCONFIG (opcionais p/ relatório):
-//  - Component config → FreeRTOS → [x] Run FreeRTOS only on first core  (UNICORE)
-//  - Component config → ESP32-specific → CPU frequency (80/160/240 MHz)
-//  - (Opcional para CPU%) FreeRTOS → [x] Use Idle Hook
-//  - (Opcional p/ runtime stats) FreeRTOS → [x] Enable Trace Facility
-//                                  FreeRTOS → [x] Generate run time stats
+//GABRIEL LAURENTINO TOURINHO - VICTOR MENZES FERREIRA
 
 #include <stdio.h>
 #include <string.h>
@@ -29,35 +14,60 @@
 #include "esp_log.h"
 
 #include "driver/gpio.h"
-#include "driver/touch_pad.h"   // legacy API (5.x)
+#include "driver/touch_pad.h"
 #include "driver/uart.h"
 
 #define TAG "ESTEIRA"
 
-// ====== Mapeamento correto dos touch pads (ESP32 WROOM) ======
+// Mapeamento dos touch pads
 // T7 = GPIO27, T8 = GPIO33, T9 = GPIO32
 #define TP_OBJ   TOUCH_PAD_NUM7   // Touch B -> detecção de objeto (GPIO27)
 #define TP_HMI   TOUCH_PAD_NUM8   // Touch C -> HMI/telemetria   (GPIO33)
 #define TP_ESTOP TOUCH_PAD_NUM9   // Touch D -> E-stop           (GPIO32)
 
-// ====== Periodicidade, prioridades, stack ======
+// Periodicidade, prioridades, stack
+/*
+//  RM 
 #define ENC_T_MS        5
-#define PRIO_ESTOP      5
-#define PRIO_ENC        4
-#define PRIO_CTRL       3
+#define PRIO_ENC        5   // maior taxa -> maior prioridade
+#define PRIO_CTRL       4
 #define PRIO_SORT       3
+#define PRIO_ESTOP      2   // no RM puro, fica abaixo
 #define PRIO_TOUCH      2
 #define PRIO_STATS      1
 #define STK_MAIN        3072
 #define STK_AUX         2048
 
-// ====== Deadlines (em microssegundos) ======
+//  DM 
+#define ENC_T_MS        5
+#define PRIO_ESTOP      5   // deadline mais curto -> prioridade máxima
+#define PRIO_ENC        4
+#define PRIO_SORT       3
+#define PRIO_CTRL       2
+#define PRIO_TOUCH      2
+#define PRIO_STATS      1
+#define STK_MAIN        3072
+#define STK_AUX         2048
+*/
+//  CUSTOM 
+#define ENC_T_MS        5
+#define PRIO_ESTOP      5   // segurança sempre em 1º lugar
+#define PRIO_ENC        4   // base temporal para todo o sistema
+#define PRIO_CTRL       3   // controle da velocidade
+#define PRIO_SORT       3   // desvio de objetos
+#define PRIO_TOUCH      2   // HMI / interface
+#define PRIO_STATS      1   // estatísticas (não crítico)
+#define STK_MAIN        3072
+#define STK_AUX         2048
+
+
+//  Deadlines (ta em microssegundos) 
 #define D_ENC_US    5000
 #define D_CTRL_US  10000
 #define D_SORT_US  10000
 #define D_SAFE_US   5000
 
-// ====== Handles/IPC ======
+//  Handles/IPC 
 static TaskHandle_t hENC = NULL, hCTRL = NULL, hSORT = NULL, hSAFE = NULL;
 static TaskHandle_t hCtrlNotify = NULL;    // ENC -> CTRL (notify)
 typedef struct { int64_t t_evt_us; } sort_evt_t;
@@ -65,7 +75,7 @@ static QueueHandle_t qSort = NULL;
 static SemaphoreHandle_t semEStop = NULL;  // disparado pelo Touch D
 static SemaphoreHandle_t semHMI   = NULL;  // disparado pelo Touch C
 
-// ====== Estado simulado da esteira ======
+//  Estado simulado da esteira 
 typedef struct {
     float rpm;     // medição de rpm
     float pos_mm;  // posição "andada" em mm
@@ -74,7 +84,7 @@ typedef struct {
 
 static belt_state_t g_belt = { .rpm = 0.f, .pos_mm = 0.f, .set_rpm = 120.0f };
 
-// ====== Instrumentação de tempo/métricas ======
+//  Instrumentação de tempo/métricas 
 typedef struct {
     volatile uint32_t releases, starts, finishes;
     volatile uint32_t hard_miss, soft_miss;
@@ -86,6 +96,7 @@ static rt_stats_t st_enc  = {0};
 static rt_stats_t st_ctrl = {0};
 static rt_stats_t st_sort = {0};
 static rt_stats_t st_safe = {0};
+static rt_stats_t st_hmi = {0};
 
 static volatile int64_t g_last_touchB_us = 0;     // release do Touch B
 static volatile int64_t g_last_touchD_us = 0;     // release do Touch D
@@ -95,12 +106,14 @@ static inline void stats_on_release(rt_stats_t *s, int64_t t_rel) {
     s->releases++;
     s->last_release_us = t_rel;
 }
+
 static inline void stats_on_start(rt_stats_t *s, int64_t t_start) {
     s->starts++;
     s->last_start_us = t_start;
     int64_t lat = t_start - s->last_release_us;
     if (lat > s->worst_latency_us) s->worst_latency_us = lat;
 }
+
 static inline void stats_on_finish(rt_stats_t *s, int64_t t_end, int64_t D_us, bool hard) {
     s->finishes++;
     s->last_end_us = t_end;
@@ -135,7 +148,7 @@ static void task_touch_poll(void *arg);
 static void task_stats(void *arg);
 static void task_uart_cmd(void *arg);
 
-// (Opcional) Idle hook para %CPU simples
+// Idle hook para %CPU simples
 #if configUSE_IDLE_HOOK
 static volatile int64_t idle_us_acc = 0;
 void vApplicationIdleHook(void) {
@@ -146,7 +159,7 @@ void vApplicationIdleHook(void) {
 }
 #endif
 
-// (Opcional) Runtime stats (requer Trace Facility + Run Time Stats)
+// Runtime stats + Trace Facility
 #if (configUSE_TRACE_FACILITY==1) && (configGENERATE_RUN_TIME_STATS==1)
 static void print_runtime_stats(void) {
     static char buf[1024];
@@ -155,7 +168,7 @@ static void print_runtime_stats(void) {
 }
 #endif
 
-/* ====== ENC_SENSE (periódica 5 ms): estima velocidade/posição ====== */
+/*  ENC_SENSE estima velocidade/posição  */
 static void task_enc_sense(void *arg)
 {
     TickType_t next = xTaskGetTickCount();
@@ -189,7 +202,7 @@ static void task_enc_sense(void *arg)
     }
 }
 
-/* ====== SPD_CTRL (encadeada): controle PI simulado + HMI (soft) ====== */
+/*  SPD_CTRL controle PI simulado + HMI (soft)  */
 static void task_spd_ctrl(void *arg)
 {
     float kp = 0.4f, ki = 0.1f, integ = 0.f;
@@ -220,14 +233,19 @@ static void task_spd_ctrl(void *arg)
 
         // Trecho não-crítico (soft): HMI
         if (xSemaphoreTake(semHMI, 0) == pdTRUE) {
-            // Ex.: se quiser medir soft-miss, poderia usar outro rt_stats_t com D=50ms
+            // Marca início da HMI
+            stats_on_start(&st_hmi, esp_timer_get_time());
+
             printf("HMI: rpm=%.1f set=%.1f pos=%.1fmm\n", g_belt.rpm, g_belt.set_rpm, g_belt.pos_mm);
+
             cpu_tight_loop_us(400); // ~0.4 ms (soft)
+
+            stats_on_finish(&st_hmi, esp_timer_get_time(), 50000, /*hard=*/false);
         }
     }
 }
 
-/* ====== SORT_ACT (evento Touch B): aciona "desviador" ====== */
+/*  SORT_ACT (evento Touch B): aciona "desviador"  */
 static void task_sort_act(void *arg)
 {
     sort_evt_t ev;
@@ -244,7 +262,7 @@ static void task_sort_act(void *arg)
     }
 }
 
-/* ====== SAFETY_TASK (evento Touch D): E-stop ====== */
+/*  SAFETY_TASK (evento Touch D): E-stop  */
 static void task_safety(void *arg)
 {
     for (;;) {
@@ -262,7 +280,7 @@ static void task_safety(void *arg)
     }
 }
 
-/* ====== TOUCH polling (B, C, D) — voltagem, filtro, baseline e debounce ====== */
+/*  TOUCH polling (B, C, D) — voltagem, filtro, baseline e debounce  */
 static void task_touch_poll(void *arg)
 {
     ESP_ERROR_CHECK(touch_pad_init());
@@ -294,7 +312,7 @@ static void task_touch_poll(void *arg)
     uint16_t th_stop = (uint16_t)(base_stop * 0.70f);
 
     bool prev_obj=false, prev_hmi=false, prev_stop=false;
-    TickType_t debounce = ticks_from_ms(30);
+    TickType_t debounce = ticks_from_ms(10);
 
     while (1) {
         uint16_t raw;
@@ -313,7 +331,11 @@ static void task_touch_poll(void *arg)
         // HMI (Touch C)
         touch_pad_read_raw_data(TP_HMI, &raw);
         bool hmi = (raw < th_hmi);
-        if (hmi && !prev_hmi) { (void)xSemaphoreGive(semHMI); ESP_LOGI(TAG, "HMI: raw=%u (thr=%u)", raw, th_hmi); }
+        if (hmi && !prev_hmi) { 
+            stats_on_release(&st_hmi, esp_timer_get_time());
+            (void)xSemaphoreGive(semHMI); 
+            ESP_LOGI(TAG, "HMI: raw=%u (thr=%u)", raw, th_hmi); 
+        }
         prev_hmi = hmi;
 
         // ESTOP (Touch D)
@@ -408,6 +430,13 @@ static void task_stats(void *arg)
             (long long)st_safe.worst_exec_us,
             (long long)st_safe.worst_latency_us,
             (long long)st_safe.worst_response_us);
+
+        ESP_LOGI(TAG, 
+            "HMI: rel=%u fin=%u soft=%u Cmax=%lldus Lmax=%lldus Rmax=%lldus",
+            st_hmi.releases, st_hmi.finishes, st_hmi.soft_miss,
+            (long long)st_hmi.worst_exec_us, 
+            (long long)st_hmi.worst_latency_us, 
+            (long long)st_hmi.worst_response_us);
 
         // %CPU simples via Idle Hook (se habilitado)
         #if configUSE_IDLE_HOOK
